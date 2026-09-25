@@ -1,7 +1,7 @@
 import m, { type Component } from 'mithril';
 import katex from 'katex';
-import { compareVersion, ProofStore, RULES } from './store';
-import type { ProofDocument, ProofStep } from './types';
+import { compareVersion, hasBlockingErrors, ProofStore, RULES } from './store';
+import type { ProofCheck, ProofDocument, ProofStep } from './types';
 
 const store = new ProofStore();
 
@@ -51,6 +51,35 @@ function download(name: string, content: string, mime: string): void {
   link.download = name;
   link.click();
   URL.revokeObjectURL(link.href);
+}
+
+/** 点击检查项：落到对应步骤；没有具体步骤的全局项落到证明目标或步骤区。 */
+function jumpToCheck(check: ProofCheck): void {
+  let target: Element | null = null;
+  if (check.stepId) {
+    store.selectStep(check.stepId);
+    target = document.querySelector(`[data-step="${check.stepId}"]`);
+  } else if (check.anchor === 'goal') {
+    target = document.querySelector('[data-anchor="goal"]');
+  } else if (check.anchor === 'steps') {
+    target = document.querySelector('[data-anchor="steps"]');
+  }
+  target?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  target?.classList.remove('flash-anchor');
+  void (target as HTMLElement | null)?.offsetWidth;
+  target?.classList.add('flash-anchor');
+  m.redraw();
+}
+
+function exportWithGuard(doc: ProofDocument, format: 'markdown' | 'latex'): void {
+  if (hasBlockingErrors(doc)) {
+    store.notify('仍有结构性错误，请先清空检查面板中的错误项，再导出定稿。');
+    globalThis.document.querySelector('[data-anchor="steps"]')?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    m.redraw();
+    return;
+  }
+  if (format === 'markdown') download(`${doc.title}.md`, exportMarkdown(doc), 'text/markdown;charset=utf-8');
+  else download(`${doc.title}.tex`, exportLatex(doc), 'application/x-tex;charset=utf-8');
 }
 
 function exportMarkdown(document: ProofDocument): string {
@@ -145,6 +174,13 @@ export class ProofApp implements Component {
     const checks = store.checks;
     const errors = checks.filter((check) => check.severity === 'error').length;
     const warnings = checks.filter((check) => check.severity === 'warning').length;
+    const blocked = errors > 0;
+    const stepSeverity = new Map<string, 'error' | 'warning'>();
+    checks.forEach((check) => {
+      if (!check.stepId || check.severity === 'info') return;
+      const current = stepSeverity.get(check.stepId);
+      if (check.severity === 'error' || current !== 'error') stepSeverity.set(check.stepId, check.severity);
+    });
     const selectedVersion = document.versions.find((version) => version.id === store.compareVersionId);
     const diff = selectedVersion ? compareVersion(document, selectedVersion) : [];
 
@@ -156,7 +192,7 @@ export class ProofApp implements Component {
         ]),
         m('div.topbar-center', [
           m('span.status-dot', { class: errors ? 'has-error' : 'is-ok' }),
-          errors ? `${errors} 个结构错误` : '证明结构可检查',
+          errors ? `${errors} 个结构错误，导出已锁定` : '依据链可从前提到达结论，可导出',
           m('span.topbar-separator'),
           `自动保存于 ${new Date(document.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`,
         ]),
@@ -197,9 +233,9 @@ export class ProofApp implements Component {
               m('span.check-total', { class: errors ? 'has-error' : '' }, errors + warnings),
             ]),
             m('div.check-summary-bars', [
-              m('span', { style: { width: `${Math.max(8, 100 - errors * 24 - warnings * 12)}%` } }),
+              m('span', { class: errors ? 'has-error' : '', style: { width: `${Math.max(8, 100 - errors * 24 - warnings * 12)}%` } }),
             ]),
-            m('p', errors ? '修正错误后再保存为定稿。' : warnings ? '结构有效，仍有待核对项。' : '当前结构与引用关系完整。'),
+            m('p', errors ? '依据链存在结构错误，已锁定导出，清空错误后自动恢复。' : warnings ? '依据链成立，仍有提示项待核对。' : '结论可从前提沿依据链一步步到达。'),
           ]),
         ]),
         m('section.editor-column', [
@@ -209,11 +245,21 @@ export class ProofApp implements Component {
               m('div.editor-meta', [`${document.author} · ${document.steps.length} 个步骤`, m('span.keyboard-hint', '拖动 ⠿ 排序')]),
             ]),
             m('div.export-actions', [
-              m('button.button.is-small', { onclick: () => download(`${document.title}.md`, exportMarkdown(document), 'text/markdown;charset=utf-8') }, '导出 Markdown'),
-              m('button.button.is-small', { onclick: () => download(`${document.title}.tex`, exportLatex(document), 'application/x-tex;charset=utf-8') }, '导出 LaTeX'),
+              m('button.button.is-small', {
+                class: blocked ? 'is-danger is-outlined' : '',
+                disabled: blocked,
+                title: blocked ? `尚有 ${errors} 个结构错误，清空后才可导出` : '导出 Markdown 证明稿',
+                onclick: () => exportWithGuard(document, 'markdown'),
+              }, blocked ? '🔒 导出已锁定' : '导出 Markdown'),
+              m('button.button.is-small', {
+                class: blocked ? 'is-danger is-outlined' : '',
+                disabled: blocked,
+                title: blocked ? `尚有 ${errors} 个结构错误，清空后才可导出` : '导出 LaTeX 证明稿',
+                onclick: () => exportWithGuard(document, 'latex'),
+              }, blocked ? '🔒 导出已锁定' : '导出 LaTeX'),
             ]),
           ]),
-          m('section.goal-card', [
+          m('section.goal-card', { 'data-anchor': 'goal' }, [
             m('div.goal-label', '证明目标'),
             m('div.goal-formula', renderRichText(`$${document.goal}$`)),
             m('input.formula-input', {
@@ -223,7 +269,7 @@ export class ProofApp implements Component {
               'aria-label': '证明目标',
             }),
           ]),
-          m('div.steps-toolbar', [
+          m('div.steps-toolbar', { 'data-anchor': 'steps' }, [
             m('div', [m('strong', '证明步骤'), m('span.steps-count', `${document.steps.length} 步`)]),
             m('div.steps-toolbar-actions', [
               m('button.button.is-small.is-white', { onclick: () => { store.addStep('premise'); m.redraw(); } }, '＋ 前提'),
@@ -233,9 +279,10 @@ export class ProofApp implements Component {
           ]),
           m('div.steps-list', document.steps.length === 0 && m('div.empty-state', '尚无步骤。按 Ctrl+Enter 开始添加。'), document.steps.map((step, index) => {
             const stepChecks = checks.filter((check) => check.stepId === step.id);
+            const severity = stepSeverity.get(step.id);
             return m('article.step-card', {
               'data-step': step.id,
-              class: step.id === store.selectedStepId ? 'is-selected' : '',
+              class: [step.id === store.selectedStepId ? 'is-selected' : '', severity ? `has-${severity}` : ''].join(' '),
               draggable: true,
               onclick: () => { store.selectStep(step.id); m.redraw(); },
               ondragstart: () => { store.dragStepId = step.id; },
@@ -251,7 +298,7 @@ export class ProofApp implements Component {
                   m('span.tag', { class: step.type === 'goal' ? 'is-success' : step.type === 'premise' ? 'is-info' : 'is-light' }, typeLabel[step.type]),
                   m('span.rule-chip', step.rule),
                   m('span.step-id', `#${shortId(step.id)}`),
-                  stepChecks.length > 0 && m('span.issue-badge', `${stepChecks.length} 项检查`),
+                  stepChecks.length > 0 && m('span.issue-badge', { class: severity ?? '' }, severity === 'error' ? `${stepChecks.length} 个错误` : `${stepChecks.length} 项提示`),
                   m('button.step-menu', { onclick: (event: Event) => { event.stopPropagation(); store.removeStep(step.id); m.redraw(); }, title: '删除步骤' }, '×'),
                 ]),
                 m('div.step-statement', renderRichText(step.statement)),
@@ -337,10 +384,15 @@ export class ProofApp implements Component {
             ]))),
           ]),
           m('section.panel.checks-panel', [
-            m('div.panel-heading', [m('span', '检查结果'), m('span.count-badge', checks.length)]),
+            m('div.panel-heading', [
+              m('span', errors ? `检查结果 · ${errors} 个错误` : '检查结果'),
+              m('span.count-badge', { class: errors ? 'has-error' : '' }, checks.length),
+            ]),
+            blocked && m('p.blocked-banner', '结构性错误未清空，导出已锁定。'),
             m('div.check-list', checks.map((check) => m('button.check-item', {
               class: check.severity,
-              onclick: () => { if (check.stepId) { store.selectStep(check.stepId); globalThis.document.querySelector(`[data-step="${check.stepId}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }); } m.redraw(); },
+              title: check.stepId ? '点击定位到该步骤' : check.anchor ? '点击定位到对应位置' : '',
+              onclick: () => jumpToCheck(check),
             }, [
               m('span.check-icon', check.severity === 'error' ? '×' : check.severity === 'warning' ? '!' : '✓'),
               m('span', [m('strong', check.title), m('small', check.detail)]),

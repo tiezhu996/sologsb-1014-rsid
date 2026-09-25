@@ -36,8 +36,13 @@ export interface ProofCheck {
   severity: CheckSeverity;
   title: string;
   detail: string;
+  /** 检查项关联的步骤；点击检查项时滚动并定位到该步骤 */
   stepId?: string;
+  /** 无具体步骤时的全局锚点，例如证明目标卡片 */
+  anchor?: CheckAnchor;
 }
+
+export type CheckAnchor = 'goal' | 'steps';
 
 export interface ProofDiff {
   kind: 'same' | 'added' | 'removed' | 'changed';

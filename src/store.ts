@@ -238,37 +238,90 @@ export class ProofStore {
   }
 }
 
-function stripLatexCommands(text: string): string {
-  return text.replace(/\\[A-Za-z]+/g, ' ').replace(/[{}_^]/g, ' ');
+/**
+ * 去掉 LaTeX 公式命令（如 \frac、\sqrt、\alpha）与括号/上下标标记，
+ * 公式命令无需登记；剩下的字母序列即视为需要解释的普通符号。
+ */
+function extractIdentifiers(text: string): string[] {
+  const stripped = text.replace(/\\[A-Za-z]+/g, ' ').replace(/[{}_^$&\\]/g, ' ');
+  return stripped.match(/[A-Za-z][A-Za-z0-9']*/g) ?? [];
 }
 
 export function validate(document: ProofDocument): ProofCheck[] {
   const checks: ProofCheck[] = [];
-  const ids = new Set(document.steps.map((step) => step.id));
+  const steps = document.steps;
+  const indexById = new Map(steps.map((step, index) => [step.id, index]));
   const symbolKeys = new Set(Object.keys(document.symbols));
-  const ignored = new Set(['a', 'A', 'b', 'B', 'n', 'k', 'P', 'Q', 'R', 'x', 'y', 'to', 'text', 'frac', 'sqrt']);
+  const labelAt = (index: number) => `步骤 ${index + 1}`;
 
-  document.steps.forEach((step, index) => {
-    const tokens = stripLatexCommands(step.statement).match(/\b[A-Za-z][A-Za-z0-9']*\b/g) ?? [];
-    const unknown = [...new Set(tokens.filter((token) => !symbolKeys.has(token) && !ignored.has(token)))];
+  // 1) 逐行核对：未解释符号（提示级），不校验依据先后。
+  steps.forEach((step, index) => {
+    const tokens = extractIdentifiers(step.statement);
+    const unknown = [...new Set(tokens.filter((token) => !symbolKeys.has(token)))];
     if (unknown.length) {
-      checks.push({ id: `symbol-${step.id}`, severity: 'warning', title: '发现未定义符号', detail: `步骤 ${index + 1} 使用了：${unknown.join('、')}`, stepId: step.id });
+      checks.push({
+        id: `symbol-${step.id}`,
+        severity: 'warning',
+        title: '发现未解释的符号',
+        detail: `${labelAt(index)} 使用了未在符号表中解释的：${unknown.join('、')}。公式命令无需登记，普通字母请补充含义。`,
+        stepId: step.id,
+      });
     }
+  });
 
+  // 2) 按步骤先后逐条核对依据：缺失、引用自己、引用后续步骤都直接判错。
+  steps.forEach((step, index) => {
+    if (step.type === 'premise' && step.references.length > 0) {
+      checks.push({
+        id: `premise-ref-${step.id}`,
+        severity: 'warning',
+        title: '前提步骤不应引用依据',
+        detail: `${labelAt(index)} 被标为前提，前提应独立成立，无需引用其他步骤。`,
+        stepId: step.id,
+      });
+    }
     step.references.forEach((reference) => {
-      if (!ids.has(reference)) {
-        checks.push({ id: `missing-${step.id}-${reference}`, severity: 'error', title: '引用步骤不存在', detail: `步骤 ${index + 1} 引用了已删除的步骤 ${reference}`, stepId: step.id });
+      if (!indexById.has(reference)) {
+        checks.push({
+          id: `missing-${step.id}-${reference}`,
+          severity: 'error',
+          title: '引用步骤不存在',
+          detail: `${labelAt(index)} 引用了已删除或不存在的步骤。`,
+          stepId: step.id,
+        });
+        return;
+      }
+      if (reference === step.id) {
+        checks.push({
+          id: `self-${step.id}`,
+          severity: 'error',
+          title: '步骤引用了自己',
+          detail: `${labelAt(index)} 把自己列为依据，推导不能自证。`,
+          stepId: step.id,
+        });
+        return;
+      }
+      const referenceIndex = indexById.get(reference)!;
+      if (referenceIndex > index) {
+        checks.push({
+          id: `forward-${step.id}-${reference}`,
+          severity: 'error',
+          title: '引用了后续步骤',
+          detail: `${labelAt(index)} 引用了排在其后的步骤 ${referenceIndex + 1}，依据只能来自此前已经写下的步骤。`,
+          stepId: step.id,
+        });
       }
     });
   });
 
-  const graph = new Map(document.steps.map((step) => [step.id, step.references.filter((id) => ids.has(id))]));
+  // 3) 兜底检查绕回自身的循环链（自引已在第 2 步单独报错，此处排除）。
+  const graph = new Map(steps.map((step) => [step.id, step.references.filter((id) => indexById.has(id) && id !== step.id)]));
   const visiting = new Set<string>();
   const visited = new Set<string>();
-  const cycleStep = new Set<string>();
+  const cycleSteps = new Set<string>();
   const visit = (id: string, path: string[]): boolean => {
     if (visiting.has(id)) {
-      path.slice(path.indexOf(id)).forEach((item) => cycleStep.add(item));
+      path.slice(path.indexOf(id)).forEach((item) => cycleSteps.add(item));
       return true;
     }
     if (visited.has(id)) return false;
@@ -278,22 +331,89 @@ export function validate(document: ProofDocument): ProofCheck[] {
     visited.add(id);
     return hasCycle;
   };
-  [...graph.keys()].forEach((id) => visit(id, []));
-  if (cycleStep.size) {
-    checks.push({ id: 'cycle', severity: 'error', title: '检测到循环引用', detail: '引用链形成闭环，请调整步骤关系。', stepId: [...cycleStep][0] });
-  }
+  steps.forEach((step) => visit(step.id, []));
+  cycleSteps.forEach((id) => {
+    const index = indexById.get(id)!;
+    checks.push({
+      id: `cycle-${id}`,
+      severity: 'error',
+      title: '依据链绕回自身',
+      detail: `${labelAt(index)} 处于循环引用链中，沿依据追溯会绕回本步，请调整引用关系。`,
+      stepId: id,
+    });
+  });
 
-  const goalStep = document.steps.find((step) => step.type === 'goal' && step.rule === '结论');
+  // 4) 从前提出发沿依据链前向传播：结论必须能一步步追溯到前提。
+  //    仅承认“存在、位于此前、且不是自己”的引用为有效依据。
+  const grounded = new Set<string>();
+  steps.forEach((step, index) => {
+    if (step.type !== 'premise') return;
+    const structurallyValid = step.references.every((reference) => {
+      const referenceIndex = indexById.get(reference);
+      return referenceIndex !== undefined && referenceIndex < index && reference !== step.id;
+    });
+    if (structurallyValid) grounded.add(step.id);
+  });
+  steps.forEach((step, index) => {
+    if (grounded.has(step.id) || cycleSteps.has(step.id)) return;
+    if (step.type === 'premise') return;
+    if (step.references.length === 0) return; // 无依据由专门的检查项提示
+    const validRefs = step.references.filter((reference) => {
+      const referenceIndex = indexById.get(reference);
+      return referenceIndex !== undefined && referenceIndex < index && reference !== step.id;
+    });
+    const ownStructureOkay = validRefs.length === step.references.length;
+    const allGrounded = validRefs.length > 0 && validRefs.every((reference) => grounded.has(reference));
+    if (allGrounded) grounded.add(step.id);
+    else if (ownStructureOkay) {
+      // 本步引用格式无误，但依据链在更上游断开：结论无法从前提到达。
+      const broken = validRefs.filter((reference) => !grounded.has(reference)).map((reference) => labelAt(indexById.get(reference)!));
+      checks.push({
+        id: `ungrounded-${step.id}`,
+        severity: 'error',
+        title: step.type === 'goal' ? '结论无法从前提到达' : '依据链断在中途',
+        detail: step.type === 'goal'
+          ? `最终结论的依据 ${broken.join('、')} 尚未成立，结论不能从前提一步步推出。`
+          : `${labelAt(index)} 的依据 ${broken.join('、')} 未能追溯到前提，本步推导悬空。`,
+        stepId: step.id,
+      });
+    }
+  });
+
+  // 5) 结论步骤检查：必须存在且有依据；能否从前提到达已在第 4 步判定。
+  const goalStep = steps.find((step) => step.type === 'goal' && step.rule === '结论');
   if (!goalStep) {
-    checks.push({ id: 'goal-missing', severity: 'error', title: '目标未被证明', detail: '请添加“结论”类型的最终步骤。' });
+    checks.push({ id: 'goal-missing', severity: 'error', title: '目标未被证明', detail: '稿中还没有“结论”类型的最终步骤，无法看出究竟证明了什么。', anchor: 'steps' });
   } else if (goalStep.references.length === 0) {
-    checks.push({ id: 'goal-unlinked', severity: 'warning', title: '结论尚无推导支撑', detail: '最终步骤没有引用任何前置步骤。', stepId: goalStep.id });
+    checks.push({
+      id: 'goal-unlinked',
+      severity: 'warning',
+      title: '结论尚无推导支撑',
+      detail: '最终结论没有引用任何前置步骤，应从最后的推导步骤得出。',
+      stepId: goalStep.id,
+    });
   }
 
+  // 6) 汇总：检查项按步骤先后排列，全局项排在最后。
+  checks.sort((a, b) => (a.stepId ? indexById.get(a.stepId) ?? Infinity : Infinity) - (b.stepId ? indexById.get(b.stepId)! : Infinity));
   if (!checks.some((check) => check.severity === 'error')) {
-    checks.push({ id: 'proof-ok', severity: 'info', title: '结构检查通过', detail: '未发现缺失引用、循环引用或未证明目标。' });
+    const warningCount = checks.filter((check) => check.severity === 'warning').length;
+    checks.push({
+      id: 'proof-ok',
+      severity: 'info',
+      title: '依据链检查通过',
+      detail: warningCount
+        ? `所有结论均可从前提沿依据链一步步到达；另有 ${warningCount} 个提示项可核对。`
+        : '所有结论均可从前提沿依据链一步步到达，结构无误。',
+      anchor: 'steps',
+    });
   }
   return checks;
+}
+
+/** 存在结构性错误（错误级检查项）时阻止导出定稿。 */
+export function hasBlockingErrors(document: ProofDocument): boolean {
+  return validate(document).some((check) => check.severity === 'error');
 }
 
 export function compareVersion(document: ProofDocument, version: ProofVersion) {
