@@ -145,6 +145,7 @@ export class ProofApp implements Component {
     const checks = store.checks;
     const errors = checks.filter((check) => check.severity === 'error').length;
     const warnings = checks.filter((check) => check.severity === 'warning').length;
+    const exportBlocked = errors > 0;
     const selectedVersion = document.versions.find((version) => version.id === store.compareVersionId);
     const diff = selectedVersion ? compareVersion(document, selectedVersion) : [];
 
@@ -156,7 +157,7 @@ export class ProofApp implements Component {
         ]),
         m('div.topbar-center', [
           m('span.status-dot', { class: errors ? 'has-error' : 'is-ok' }),
-          errors ? `${errors} 个结构错误` : '证明结构可检查',
+          errors ? `${errors} 个结构错误` : '结构检查通过',
           m('span.topbar-separator'),
           `自动保存于 ${new Date(document.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`,
         ]),
@@ -199,7 +200,7 @@ export class ProofApp implements Component {
             m('div.check-summary-bars', [
               m('span', { style: { width: `${Math.max(8, 100 - errors * 24 - warnings * 12)}%` } }),
             ]),
-            m('p', errors ? '修正错误后再保存为定稿。' : warnings ? '结构有效，仍有待核对项。' : '当前结构与引用关系完整。'),
+            m('p', errors ? '存在结构错误，导出已锁定，请逐项修正。' : warnings ? '结构有效，仍有待核对项。' : '依据链完整，结论可追溯到前提。'),
           ]),
         ]),
         m('section.editor-column', [
@@ -209,8 +210,17 @@ export class ProofApp implements Component {
               m('div.editor-meta', [`${document.author} · ${document.steps.length} 个步骤`, m('span.keyboard-hint', '拖动 ⠿ 排序')]),
             ]),
             m('div.export-actions', [
-              m('button.button.is-small', { onclick: () => download(`${document.title}.md`, exportMarkdown(document), 'text/markdown;charset=utf-8') }, '导出 Markdown'),
-              m('button.button.is-small', { onclick: () => download(`${document.title}.tex`, exportLatex(document), 'application/x-tex;charset=utf-8') }, '导出 LaTeX'),
+              exportBlocked && m('span.export-lock', '结构错误未清除 · 导出已锁定'),
+              m('button.button.is-small', {
+                disabled: exportBlocked,
+                title: exportBlocked ? '请先修正检查结果中的结构错误，清除后自动恢复导出' : '导出为 Markdown 文件',
+                onclick: () => download(`${document.title}.md`, exportMarkdown(document), 'text/markdown;charset=utf-8'),
+              }, '导出 Markdown'),
+              m('button.button.is-small', {
+                disabled: exportBlocked,
+                title: exportBlocked ? '请先修正检查结果中的结构错误，清除后自动恢复导出' : '导出为 LaTeX 文件',
+                onclick: () => download(`${document.title}.tex`, exportLatex(document), 'application/x-tex;charset=utf-8'),
+              }, '导出 LaTeX'),
             ]),
           ]),
           m('section.goal-card', [
@@ -339,11 +349,13 @@ export class ProofApp implements Component {
           m('section.panel.checks-panel', [
             m('div.panel-heading', [m('span', '检查结果'), m('span.count-badge', checks.length)]),
             m('div.check-list', checks.map((check) => m('button.check-item', {
-              class: check.severity,
+              class: `${check.severity}${check.stepId ? '' : ' is-static'}`,
+              title: check.stepId ? '点击定位到对应步骤' : undefined,
               onclick: () => { if (check.stepId) { store.selectStep(check.stepId); globalThis.document.querySelector(`[data-step="${check.stepId}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }); } m.redraw(); },
             }, [
               m('span.check-icon', check.severity === 'error' ? '×' : check.severity === 'warning' ? '!' : '✓'),
               m('span', [m('strong', check.title), m('small', check.detail)]),
+              check.stepId && m('span.check-arrow', '→'),
             ]))),
           ]),
           m('section.shortcut-card', [
